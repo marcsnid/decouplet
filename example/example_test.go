@@ -3,10 +3,11 @@ package example
 import (
 	"bytes"
 	"crypto/rand"
-	"github.com/marcsj/decouplet"
 	"io"
 	"log"
 	"testing"
+
+	"github.com/marcsnid/decouplet"
 )
 
 func Test_AESExample(t *testing.T) {
