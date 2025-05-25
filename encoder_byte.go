@@ -91,7 +91,7 @@ func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
 
 	buffer := make([]byte, byteEncodedSize)
 	for {
-		end, err := checkForETX(r, buffer)
+		end, err := readAndCheckETX(r, buffer, byteEncodedSize)
 		if err != nil {
 			return err
 		}
@@ -99,10 +99,6 @@ func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
 			break
 		}
 
-		// Read remaining bytes for each encoded byte
-		if _, err := io.ReadFull(r, buffer[1:]); err != nil {
-			return err
-		}
 		x1 := binary.BigEndian.Uint16(buffer[0:2])
 		x2 := binary.BigEndian.Uint16(buffer[2:4])
 		supplement := buffer[4]

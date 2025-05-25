@@ -50,18 +50,20 @@ func readAndVerifyStart(r io.Reader) error {
 	return nil
 }
 
-func checkForETX(r io.Reader, buffer []byte) (bool, error) {
-	peek := make([]byte, 1)
-	defer func() { buffer[0] = peek[0] }()
-	n, err := r.Read(peek)
+func readAndCheckETX(r io.Reader, buffer []byte, recordSize int) (bool, error) {
+	n, err := io.ReadFull(r, buffer[:recordSize])
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// If we only got 1 byte and it's ETX, that's the end
+		if n == 1 && buffer[0] == etxByte {
+			return true, nil
+		}
+		if n == 0 {
+			return false, io.EOF
+		}
+		return false, ErrorDecodeNotFound
+	}
 	if err != nil {
 		return false, err
-	}
-	if n == 0 {
-		return false, nil
-	}
-	if peek[0] == etxByte {
-		return true, nil
 	}
 	return false, nil
 }

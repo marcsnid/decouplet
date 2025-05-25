@@ -111,17 +111,12 @@ func (i *imageEncoder) decode(r io.Reader, w io.Writer) error {
 
 	buffer := make([]byte, imageEncodedSize)
 	for {
-		end, err := checkForETX(r, buffer)
+		end, err := readAndCheckETX(r, buffer, imageEncodedSize)
 		if err != nil {
 			return err
 		}
 		if end {
 			break
-		}
-
-		// Read the remaining bytes into the buffer
-		if _, err := io.ReadFull(r, buffer[1:]); err != nil {
-			return err
 		}
 
 		x1 := binary.BigEndian.Uint16(buffer[0:2])

@@ -10,7 +10,7 @@ import (
 // For these tests, ensure you have:
 // - A test image named "test.png" in the current directory or a specified path.
 // - A second test image named "test2.png" for the ECB test.
-// - A PPM image named "Tux.ppm" for the ECB test.
+// - A PPM image named "tux.ppm" for the ECB test.
 
 // TestImageEncoder_Full tests the encoding and decoding functionality of the ImageEncoder
 func TestImageEncoder_Full(t *testing.T) {
@@ -97,7 +97,7 @@ func TestImageEncoder_ImageECB(t *testing.T) {
 	}
 
 	// Load the PPM image to encode
-	ppmFile, err := os.Open("Tux.ppm")
+	ppmFile, err := os.Open("tux.ppm")
 	if err != nil {
 		t.Fatalf("failed to open PPM file: %v", err)
 	}
