@@ -19,12 +19,8 @@ var (
 )
 
 const (
-	imageMatchFindRetries int  = 4
-	imageKeySize          int  = 300
-	imageCheckedMax       int  = 46368
-	imageRetriesPerByte   int  = 150000
-	stxByte               byte = 0x02 // Start of Text
-	etxByte               byte = 0x03 // End of Text
+	stxByte byte = 0x02 // Start of Text
+	etxByte byte = 0x03 // End of Text
 )
 
 type Encoder interface {

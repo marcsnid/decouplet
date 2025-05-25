@@ -15,8 +15,16 @@ const (
 	imageChannelM
 	imageChannelY
 	imageChannelK
+
+	imageEncodedSize          = 10 // Each image encoding is 10 bytes
+	imageMatchFindRetries int = 4
+	imageKeySize          int = 300
+	imageCheckedMax       int = 46368
+	imageRetriesPerByte   int = 150000
 )
 
+// ImageEncoder is an implementation of the Encoder that uses image.Image as a key
+// It encodes and decodes data by using pixel values in the image.
 type imageEncoder struct {
 	Key image.Image
 }
@@ -24,6 +32,7 @@ type imageEncoder struct {
 func NewImageEncoder(key image.Image) Encoder {
 	return &imageEncoder{Key: key}
 }
+
 func (i *imageEncoder) Encode(r io.Reader, w io.Writer) error {
 	err := i.Validate()
 	if err != nil {
@@ -32,6 +41,7 @@ func (i *imageEncoder) Encode(r io.Reader, w io.Writer) error {
 	return i.encode(r, w)
 }
 
+// encode is the main encoding function for the image encoder.
 func (i *imageEncoder) encode(r io.Reader, w io.Writer) error {
 	bounds := i.Key.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
@@ -40,6 +50,7 @@ func (i *imageEncoder) encode(r io.Reader, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)
@@ -51,19 +62,11 @@ func (i *imageEncoder) encode(r io.Reader, w io.Writer) error {
 						return ErrorMatchNotFound
 					}
 					checks++
-					x1, err := getRandomInt(int64(width))
+					x1, x2, err := getRandomPair(int64(width))
 					if err != nil {
 						return err
 					}
-					x2, err := getRandomInt(int64(width))
-					if err != nil {
-						return err
-					}
-					y1, err := getRandomInt(int64(height))
-					if err != nil {
-						return err
-					}
-					y2, err := getRandomInt(int64(height))
+					y1, y2, err := getRandomPair(int64(height))
 					if err != nil {
 						return err
 					}
@@ -99,23 +102,25 @@ func (i *imageEncoder) Decode(r io.Reader, w io.Writer) error {
 	return i.decode(r, w)
 }
 
+// decode is the main decoding function for the image encoder.
 func (i *imageEncoder) decode(r io.Reader, w io.Writer) error {
 	err := readAndVerifyStart(r)
 	if err != nil {
 		return err
 	}
 
-	// 10-byte record for image encoding
-	buffer := make([]byte, 10)
+	buffer := make([]byte, imageEncodedSize)
 	for {
-		n, err := io.ReadFull(r, buffer)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			if n == 1 && buffer[0] == etxByte {
-				break
-			}
-			return ErrorDecodeNotFound
-		}
+		end, err := checkForETX(r, buffer)
 		if err != nil {
+			return err
+		}
+		if end {
+			break
+		}
+
+		// Read the remaining bytes into the buffer
+		if _, err := io.ReadFull(r, buffer[1:]); err != nil {
 			return err
 		}
 
