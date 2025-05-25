@@ -8,8 +8,8 @@ import (
 const (
 	byteRetriesPerByte = 1000 // Number of retries to find a match for each byte
 	byteEncodedSize    = 5    // Each byte is encoded as 5 bytes
-	maxKeySize         = 512  // Maximum key size for byte encoder
-	minKeySize         = 32   // Minimum key size for byte encoder
+	byteMaxKeySize     = 512  // Maximum key size for byte encoder
+	byteMinKeySize     = 32   // Minimum key size for byte encoder
 )
 
 // ByteEncoder is an implementation of the Encoder that uses a byte slice as a key
@@ -29,6 +29,7 @@ func (b *byteEncoder) Encode(r io.Reader, w io.Writer) error {
 	return b.encode(r, w)
 }
 
+// encode is the main encoding function for the byte encoder.
 func (b *byteEncoder) encode(r io.Reader, w io.Writer) error {
 	bounds := len(b.Key)
 
@@ -81,6 +82,7 @@ func (b *byteEncoder) Decode(r io.Reader, w io.Writer) error {
 	return b.decode(r, w)
 }
 
+// decode is the main decoding function for the byte encoder.
 func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
 	err := readAndVerifyStart(r)
 	if err != nil {
@@ -96,7 +98,8 @@ func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
 		if end {
 			break
 		}
-		// Read the remaining 3 bytes
+
+		// Read remaining bytes for each encoded byte
 		if _, err := io.ReadFull(r, buffer[1:]); err != nil {
 			return err
 		}
@@ -115,7 +118,7 @@ func (b *byteEncoder) Validate() error {
 	if len(b.Key) == 0 {
 		return ErrorInvalidKey
 	}
-	if len(b.Key) < 32 || len(b.Key) > 512 {
+	if len(b.Key) < byteMinKeySize || len(b.Key) > byteMaxKeySize {
 		return ErrorBytesInvalidKeyLength
 	}
 	return nil
