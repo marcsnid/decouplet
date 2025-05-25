@@ -1,286 +1,133 @@
 package decouplet
 
 import (
-	"errors"
-	"fmt"
+	"encoding/binary"
 	"io"
-	"math/rand"
-	"strconv"
-	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().Unix())
+const (
+	byteRetriesPerByte = 1000 // Number of retries to find a match for each byte
+	byteEncodedSize    = 5    // Each byte is encoded as 5 bytes
+	byteMaxKeySize     = 512  // Maximum key size for byte encoder
+	byteMinKeySize     = 32   // Minimum key size for byte encoder
+)
+
+// ByteEncoder is an implementation of the Encoder that uses a byte slice as a key
+type byteEncoder struct {
+	Key []byte
 }
 
-type byteChecked struct {
-	kind   string
-	amount uint8
+func NewByteEncoder(key []byte) Encoder {
+	return &byteEncoder{Key: key}
 }
 
-type bytesKey []byte
-
-const matchFindRetriesByte = 16
-const minByteKeySize = 64
-const byteCheckedMax = 255
-
-var errorByteKeyTooShort = errors.New("key is smaller than minimum length of 64 bytes")
-
-func (bytesKey) getVersion() encoderInfo {
-	return encoderInfo{
-		Name:    "byteec",
-		Version: "0.2",
+func (b *byteEncoder) Encode(r io.Reader, w io.Writer) error {
+	err := b.Validate()
+	if err != nil {
+		return err
 	}
+	return b.encode(r, w)
 }
 
-func (k bytesKey) checkValid() (bool, error) {
-	if len(k) < minByteKeySize {
-		return false, errorByteKeyTooShort
+// encode is the main encoding function for the byte encoder.
+func (b *byteEncoder) encode(r io.Reader, w io.Writer) error {
+	bounds := len(b.Key)
+
+	err := startEncode(w)
+	if err != nil {
+		return err
 	}
-	return true, nil
-}
-
-func (k bytesKey) checkVariance() int {
-	charMap := map[byte]bool{}
-	for _, b := range k {
-		charMap[b] = true
-	}
-	return int((float32(len(charMap)) / byteCheckedMax) * 100)
-}
-
-func (bytesKey) getDictionarySet() dictionarySet {
-	return dictionarySet("abcdefghijk")
-}
-
-func (bytesKey) getDictionary() dictionary {
-	return dictionary{
-		decoders: []decodeRef{
-			{
-				character: 'a',
-				amount:    0,
-			},
-			{
-				character: 'b',
-				amount:    1,
-			},
-			{
-				character: 'c',
-				amount:    2,
-			},
-			{
-				character: 'd',
-				amount:    4,
-			},
-			{
-				character: 'e',
-				amount:    6,
-			},
-			{
-				character: 'f',
-				amount:    8,
-			},
-			{
-				character: 'g',
-				amount:    10,
-			},
-			{
-				character: 'h',
-				amount:    16,
-			},
-			{
-				character: 'i',
-				amount:    32,
-			},
-			{
-				character: 'j',
-				amount:    64,
-			},
-			{
-				character: 'k',
-				amount:    128,
-			},
-		},
-	}
-}
-
-// EncodeBytes encodes a slice of bytes against a key which is a slice of bytes.
-func EncodeBytes(input []byte, key []byte) ([]byte, error) {
-	return encode(
-		input, bytesKey(key), findBytePattern)
-}
-
-// EncodeBytesStream encodes a byte stream against a key which is a slice of bytes.
-func EncodeBytesStream(input io.Reader, key []byte) (*io.PipeReader, error) {
-	return encodeStream(
-		input, bytesKey(key), findBytePattern)
-}
-
-// EncodeBytesStreamPartial encodes a byte stream partially against a key which is a slice of bytes.
-// Arguments take and skip are used to determine how many bytes to take, and skip along a stream.
-func EncodeBytesStreamPartial(input io.Reader, key []byte, take int, skip int) (*io.PipeReader, error) {
-	return encodePartialStream(
-		input, bytesKey(key), take, skip, findBytePattern)
-}
-
-// DecodeBytes decodes a slice of bytes against a key which is a slice of bytes.
-func DecodeBytes(input []byte, key []byte) ([]byte, error) {
-	return decode(
-		input, bytesKey(key), 2, getByteDefs)
-}
-
-// DecodeBytesStream decodes a byte stream against a key which is a slice of bytes.
-func DecodeBytesStream(input io.Reader, key []byte) (*io.PipeReader, error) {
-	return decodeStream(
-		input, bytesKey(key), 2, getByteDefs)
-}
-
-// DecodeBytesStreamPartial decodes a byte stream with delimiters
-// against a key which is a slice of bytes.
-func DecodeBytesStreamPartial(input io.Reader, key []byte) (*io.PipeReader, error) {
-	return decodePartialStream(
-		input, bytesKey(key), 2, getByteDefs)
-}
-
-// AnalyzeBytesKey takes a slice of bytes and analyzes its scale of usefulness at encoding.
-func AnalyzeBytesKey(key []byte) (scale int) {
-	dict := bytesKey(key).getDictionary()
-	found := 0.0
-	for i := 0; i < 255; i++ {
-		perByte := 0.0
-		for j := 0; j < matchFindRetriesByte; j++ {
-			randByte := key[rand.Intn(len(key))]
-			for k := 0; k < len(key); k++ {
-				success, _, _ := checkByteMatch(byte(i), randByte, key[k], dict)
-				if success {
-					perByte++
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			checks := 0
+			for idx := 0; idx < n; idx++ {
+				found := false
+				for !found {
+					checks++
+					if checks >= byteRetriesPerByte {
+						return ErrorMatchNotFound
+					}
+					x1, x2, err := getRandomPair(int64(bounds))
+					if err != nil {
+						return err
+					}
+					match, supplement := checkMatch(buf[idx], uint16(x1), uint16(x2))
+					if match {
+						err = encodeByte(uint16(x1), uint16(x2), uint8(supplement), w)
+						if err != nil {
+							return err
+						}
+						found = true
+					}
 				}
-				continue
 			}
 		}
-		found += perByte / float64(matchFindRetriesByte)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
 	}
-	return int(float64(found) / 255.0)
+	return finishEncode(w)
 }
 
-func getByteDefs(key encodingKey, group decodeGroup) (byte, error) {
-	if len(group.place) < 2 {
-		return 0, errorDecodeGroup
-	}
-	bytes, ok := key.(bytesKey)
-	if !ok {
-		return 0, errorKeyCastFailed
-	}
-	dict := key.getDictionary()
-
-	loc1, err := strconv.Atoi(group.place[0])
+func (b *byteEncoder) Decode(r io.Reader, w io.Writer) error {
+	err := b.Validate()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	loc2, err := strconv.Atoi(group.place[1])
+	return b.decode(r, w)
+}
+
+// decode is the main decoding function for the byte encoder.
+func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
+	err := readAndVerifyStart(r)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
-	var change1 uint8
-	var change2 uint8
-	for _, g := range dict.decoders {
-		if g.character == group.kind[0] {
-			if len(bytes) >= loc1 {
-				change1 = bytes[loc1] + g.amount
-			} else {
-				return 0, errorDecodeGeneric
-			}
+	buffer := make([]byte, byteEncodedSize)
+	for {
+		end, err := readAndCheckETX(r, buffer, byteEncodedSize)
+		if err != nil {
+			return err
+		}
+		if end {
+			break
+		}
+
+		x1 := binary.BigEndian.Uint16(buffer[0:2])
+		x2 := binary.BigEndian.Uint16(buffer[2:4])
+		supplement := buffer[4]
+		decoded := byte((int(x1) - int(x2) + int(supplement) + 256) % 256)
+		if _, err := w.Write([]byte{decoded}); err != nil {
+			return err
 		}
 	}
-	for _, g := range dict.decoders {
-		if g.character == group.kind[1] {
-			if len(bytes) >= loc2 {
-				change2 = bytes[loc2] + g.amount
-			} else {
-				return 0, errorDecodeGeneric
-			}
-		}
-	}
-	return change2 - change1, nil
+	return nil
 }
 
-func findBytePattern(char byte, key encodingKey) ([]byte, error) {
-	bytesKey, ok := key.(bytesKey)
-	if !ok {
-		return nil, errorKeyCastFailed
+func (b *byteEncoder) Validate() error {
+	if len(b.Key) == 0 {
+		return ErrorInvalidKey
 	}
-	pattern := make([]byte, 0)
-	var err error
-
-	for i := 0; i < matchFindRetriesByte; i++ {
-		pattern, err = getBytePattern(char, bytesKey)
-		if err == nil {
-			return pattern, nil
-		}
+	if len(b.Key) < byteMinKeySize || len(b.Key) > byteMaxKeySize {
+		return ErrorBytesInvalidKeyLength
 	}
-
-	return nil, err
+	return nil
 }
 
-func getBytePattern(char byte, key bytesKey) ([]byte, error) {
-	bounds := len(key)
-	current := rand.Intn(bounds)
-	startFinding := rand.Intn(bounds)
-	dictionary := key.getDictionary()
-
-	var pattern []byte
-	var err error
-
-	if startFinding > bounds/2 {
-		for x := startFinding; x >= 0; x-- {
-			pattern, err = findBytePartner(current, x, char, key, dictionary)
-			if err == nil {
-				return pattern, nil
-			}
-		}
-	} else {
-		for x := startFinding; x < bounds; x++ {
-			pattern, err = findBytePartner(current, x, char, key, dictionary)
-			if err == nil {
-				return pattern, nil
-			}
-		}
+func encodeByte(x1, x2 uint16, supplement uint8, w io.Writer) error {
+	err := binary.Write(w, binary.BigEndian, x1)
+	if err != nil {
+		return err
 	}
-
-	return nil, err
-}
-
-func findBytePartner(
-	current int,
-	checked int,
-	difference byte,
-	bytes []byte,
-	dict dictionary) ([]byte, error) {
-	if match, firstType, secondType := checkByteMatch(
-		difference, bytes[current], bytes[checked], dict); match {
-		return []byte(fmt.Sprintf(
-			"%s%v%s%v",
-			string(firstType), current,
-			string(secondType), checked)), nil
+	err = binary.Write(w, binary.BigEndian, x2)
+	if err != nil {
+		return err
 	}
-
-	return nil, errorMatchNotFound
-}
-
-func checkByteMatch(
-	diff byte,
-	current byte,
-	checked byte,
-	dict dictionary) (bool, uint8, uint8) {
-	for v := range dict.decoders {
-		for k := range dict.decoders {
-			if checked+dict.decoders[k].amount ==
-				current+dict.decoders[v].amount+uint8(diff) {
-				return true,
-					dict.decoders[v].character,
-					dict.decoders[k].character
-			}
-		}
-	}
-	return false, 0, 0
+	return binary.Write(w, binary.BigEndian, supplement)
 }

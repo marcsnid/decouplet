@@ -1,320 +1,268 @@
 package decouplet
 
 import (
-	"errors"
-	"fmt"
+	"encoding/binary"
 	"image"
-	"image/color"
 	"io"
-	"math/rand"
-	"strconv"
-	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().Unix())
+const (
+	imageChannelR uint8 = iota
+	imageChannelG
+	imageChannelB
+	imageChannelA
+	imageChannelC
+	imageChannelM
+	imageChannelY
+	imageChannelK
+
+	imageEncodedSize          = 10 // Each image encoding is 10 bytes
+	imageMatchFindRetries int = 4
+	imageKeySize          int = 300
+	imageCheckedMax       int = 46368
+	imageRetriesPerByte   int = 150000
+)
+
+// ImageEncoder is an implementation of the Encoder that uses image.Image as a key
+// It encodes and decodes data by using pixel values in the image.
+type imageEncoder struct {
+	Key image.Image
 }
 
-type imageKey struct {
-	image.Image
+func NewImageEncoder(key image.Image) Encoder {
+	return &imageEncoder{Key: key}
 }
 
-const matchFindRetriesImage = 4
-const imageKeySize = 300
-const imageCheckedMax = 46368
-
-var errorImageKeyTooSmall = errors.New("key needs to be larger than 300x300")
-
-func (imageKey) getVersion() encoderInfo {
-	return encoderInfo{
-		Name:    "imgec",
-		Version: "0.2",
-	}
-}
-
-func (k imageKey) checkVariance() int {
-	colorMap := map[color.Color]bool{}
-	for x := 0; x < k.Image.Bounds().Max.X; x++ {
-		for y := 0; y < k.Image.Bounds().Max.Y; y++ {
-			colorMap[k.At(x, y)] = true
-		}
-	}
-	return int((float32(len(colorMap)) / imageCheckedMax) * 100)
-}
-
-func (k imageKey) checkValid() (bool, error) {
-	if k.Image.Bounds().Max.X < imageKeySize || k.Image.Bounds().Max.Y < imageKeySize {
-		return false, errorImageKeyTooSmall
-	}
-	return true, nil
-}
-
-func (imageKey) getDictionarySet() dictionarySet {
-	return dictionarySet("rgbacmyk")
-}
-
-func (imageKey) getDictionary() dictionary {
-	return dictionary{
-		decoders: []decodeRef{
-			{
-				character: 'r',
-				amount:    0,
-			},
-			{
-				character: 'g',
-				amount:    0,
-			},
-			{
-				character: 'b',
-				amount:    0,
-			},
-			{
-				character: 'a',
-				amount:    0,
-			},
-			{
-				character: 'c',
-				amount:    0,
-			},
-			{
-				character: 'm',
-				amount:    0,
-			},
-			{
-				character: 'y',
-				amount:    0,
-			},
-			{
-				character: 'k',
-				amount:    0,
-			},
-		},
-	}
-}
-
-func dictionaryRGBACMYK(col color.Color, dict dictionary) dictionary {
-	r, g, b, a := col.RGBA()
-	c, m, y, k := color.RGBToCMYK(uint8(r), uint8(g), uint8(b))
-	for i := range dict.decoders {
-		switch dict.decoders[i].character {
-		case 'r':
-			dict.decoders[i].amount = uint8(r)
-		case 'g':
-			dict.decoders[i].amount = uint8(g)
-		case 'b':
-			dict.decoders[i].amount = uint8(b)
-		case 'a':
-			dict.decoders[i].amount = uint8(a)
-		case 'c':
-			dict.decoders[i].amount = uint8(c)
-		case 'm':
-			dict.decoders[i].amount = uint8(m)
-		case 'y':
-			dict.decoders[i].amount = uint8(y)
-		case 'k':
-			dict.decoders[i].amount = uint8(k)
-		}
-	}
-	return dict
-}
-
-// EncodeImage encodes a slice of bytes against an image key.
-func EncodeImage(input []byte, key image.Image) ([]byte, error) {
-	return encode(
-		input, imageKey{key}, findPixelPattern)
-	return nil, nil
-}
-
-// EncodeImageStream encodes a stream of bytes against an image key.
-func EncodeImageStream(input io.Reader, key image.Image) (*io.PipeReader, error) {
-	return encodeStream(
-		input, imageKey{key}, findPixelPattern)
-}
-
-// EncodeImageStreamPartial encodes a byte stream partially against an image key.
-// Arguments take and skip are used to determine how many bytes to take, and skip along a stream.
-func EncodeImageStreamPartial(input io.Reader, key image.Image, take int, skip int) (*io.PipeReader, error) {
-	return encodePartialStream(
-		input, imageKey{key}, take, skip, findPixelPattern)
-}
-
-// DecodeImage encodes a slice of bytes against an image key.
-func DecodeImage(input []byte, key image.Image) ([]byte, error) {
-	return decode(
-		input, imageKey{key}, 2, getImgDefs)
-}
-
-// DecodeImageStream decodes a stream of bytes against an image key.
-func DecodeImageStream(input io.Reader, key image.Image) (*io.PipeReader, error) {
-	return decodeStream(
-		input, imageKey{key}, 2, getImgDefs)
-}
-
-// DecodeImageStreamPartial decodes a byte stream with delimiters against an image key.
-func DecodeImageStreamPartial(input io.Reader, key image.Image) (*io.PipeReader, error) {
-	return decodePartialStream(
-		input, imageKey{key}, 2, getImgDefs)
-}
-
-func getImgDefs(key encodingKey, group decodeGroup) (byte, error) {
-	if len(group.place) < 2 {
-		return 0, errors.New("decode group missing locations")
-	}
-	img, ok := key.(imageKey)
-	if !ok {
-		return 0, errors.New("failed to cast key")
-	}
-	dict := key.getDictionary()
-
-	loc1, err := strconv.Atoi(group.place[0])
+func (i *imageEncoder) Encode(r io.Reader, w io.Writer) error {
+	err := i.Validate()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	loc2, err := strconv.Atoi(group.place[1])
-	if err != nil {
-		return 0, err
-	}
-	location1, err := getXYLocation(loc1, img.Bounds().Max.X)
-	if err != nil {
-		return 0, err
-	}
-	location2, err := getXYLocation(loc2, img.Bounds().Max.X)
-	if err != nil {
-		return 0, err
-	}
-
-	var change1 uint8
-	var change2 uint8
-	changeColor1 := img.At(location1.x, location1.y)
-	changeColor2 := img.At(location2.x, location2.y)
-	dict1 := dictionaryRGBACMYK(changeColor1, dict)
-	dict2 := dictionaryRGBACMYK(changeColor2, dict)
-
-	for _, g := range dict1.decoders {
-		if g.character == group.kind[0] {
-			change1 = g.amount
-		}
-	}
-	for _, g := range dict2.decoders {
-		if g.character == group.kind[1] {
-			change2 = g.amount
-		}
-	}
-	return change2 - change1, nil
+	return i.encode(r, w)
 }
 
-func findPixelPattern(char byte, key encodingKey) ([]byte, error) {
-	imageKey, ok := key.(imageKey)
-	if !ok {
-		return nil, errorKeyCastFailed
-	}
-	var pattern []byte
-	var err error
+// encode is the main encoding function for the image encoder.
+func (i *imageEncoder) encode(r io.Reader, w io.Writer) error {
+	bounds := i.Key.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
 
-	for i := 0; i < matchFindRetriesImage; i++ {
-		pattern, err = getPixelPattern(char, imageKey)
-		if err == nil {
-			return pattern, nil
-		}
+	err := startEncode(w)
+	if err != nil {
+		return err
 	}
 
-	return nil, err
-}
-
-func getPixelPattern(char byte, key imageKey) ([]byte, error) {
-	bounds := key.Bounds()
-	currentX := rand.Intn(bounds.Max.X)
-	currentY := rand.Intn(bounds.Max.Y)
-	startX := rand.Intn(bounds.Max.X)
-	startY := rand.Intn(bounds.Max.Y)
-	dictionary := key.getDictionary()
-
-	pattern := make([]byte, 0)
-	var err error
-
-	currentLocation := location{x: currentX, y: currentY}
-	currentColor := key.At(currentX, currentY)
-
-	changeX := 0
-	changeY := 0
-
-	if startX > bounds.Max.X/2 {
-		changeX = -1
-	} else {
-		changeX = 1
-	}
-	if startY > bounds.Max.Y/2 {
-		changeY = -1
-	} else {
-		changeY = 1
-	}
-
-	for x := startX; (changeX == -1 && x >= 0) ||
-		(changeX == 1 && x < bounds.Max.X); x += changeX {
-		for y := startY; (changeY == -1 && y >= 0) ||
-			(changeY == 1 && y < bounds.Max.Y); y += changeY {
-
-			checkedLocation := location{x, y}
-			checkedColor := key.At(x, y)
-			pattern, err = findPixelPartner(
-				currentLocation, checkedLocation, char, currentColor, checkedColor, key, dictionary)
-			if err == nil {
-				return pattern, nil
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			checks := 0
+			for idx := 0; idx < n; idx++ {
+				for {
+					if checks >= imageRetriesPerByte {
+						return ErrorMatchNotFound
+					}
+					checks++
+					x1, x2, err := getRandomPair(int64(width))
+					if err != nil {
+						return err
+					}
+					y1, y2, err := getRandomPair(int64(height))
+					if err != nil {
+						return err
+					}
+					found, channel, supplement, err := getImagePixelMatch(buf[idx], i.Key, int64(x1), int64(y1), int64(x2), int64(y2))
+					if err != nil {
+						return err
+					}
+					if found {
+						err = encodeImage(uint16(x1), uint16(y1), uint16(x2), uint16(y2), channel, supplement, w)
+						if err != nil {
+							return err
+						}
+						break
+					}
+				}
 			}
 		}
-	}
-
-	return nil, err
-}
-
-func findPixelPartner(
-	currentLocation location,
-	checkedLocation location,
-	difference byte,
-	currentColor color.Color,
-	checkedColor color.Color,
-	key image.Image,
-	dict dictionary) ([]byte, error) {
-	bounds := key.Bounds()
-	if match, firstType, secondType := checkColorMatch(
-		difference, currentColor, checkedColor, dict); match {
-		firstLocation := getPixelNumber(
-			currentLocation.x, currentLocation.y, bounds.Max.X)
-		secondLocation := getPixelNumber(
-			checkedLocation.x, checkedLocation.y, bounds.Max.X)
-		return []byte(fmt.Sprintf(
-			"%s%v%s%v",
-			string(firstType), firstLocation,
-			string(secondType), secondLocation)), nil
-	}
-
-	return nil, errorMatchNotFound
-}
-
-func checkColorMatch(
-	diff byte,
-	current color.Color,
-	checked color.Color,
-	dict dictionary) (bool, uint8, uint8) {
-	currentColors := dictionaryRGBACMYK(current, dict)
-	checkedColors := dictionaryRGBACMYK(checked, dict)
-	for v := range currentColors.decoders {
-		for k := range checkedColors.decoders {
-			if checkedColors.decoders[k].amount ==
-				currentColors.decoders[v].amount+uint8(diff) {
-				return true,
-					currentColors.decoders[v].character,
-					currentColors.decoders[k].character
-			}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return false, 0, 0
+	return finishEncode(w)
 }
 
-func getXYLocation(loc int, imageWidth int) (location, error) {
-	location := location{}
-	x, y := getCoordinates(loc, imageWidth)
-	location.x = x
-	location.y = y
-	return location, nil
+func (i *imageEncoder) Decode(r io.Reader, w io.Writer) error {
+	err := i.Validate()
+	if err != nil {
+		return err
+	}
+	return i.decode(r, w)
+}
+
+// decode is the main decoding function for the image encoder.
+func (i *imageEncoder) decode(r io.Reader, w io.Writer) error {
+	err := readAndVerifyStart(r)
+	if err != nil {
+		return err
+	}
+
+	buffer := make([]byte, imageEncodedSize)
+	for {
+		end, err := readAndCheckETX(r, buffer, imageEncodedSize)
+		if err != nil {
+			return err
+		}
+		if end {
+			break
+		}
+
+		x1 := binary.BigEndian.Uint16(buffer[0:2])
+		y1 := binary.BigEndian.Uint16(buffer[2:4])
+		x2 := binary.BigEndian.Uint16(buffer[4:6])
+		y2 := binary.BigEndian.Uint16(buffer[6:8])
+		channel := buffer[8]
+		supplement := buffer[9]
+
+		var v1, v2 uint32
+		if cmykImg, ok := i.Key.(*image.CMYK); ok {
+			c1, m1, y1c, k1 := cmykImg.CMYKAt(int(x1), int(y1)).C,
+				cmykImg.CMYKAt(int(x1), int(y1)).M,
+				cmykImg.CMYKAt(int(x1), int(y1)).Y,
+				cmykImg.CMYKAt(int(x1), int(y1)).K
+			c2, m2, y2c, k2 := cmykImg.CMYKAt(int(x2), int(y2)).C,
+				cmykImg.CMYKAt(int(x2), int(y2)).M,
+				cmykImg.CMYKAt(int(x2), int(y2)).Y,
+				cmykImg.CMYKAt(int(x2), int(y2)).K
+			switch channel {
+			case imageChannelC:
+				v1, v2 = uint32(c1), uint32(c2)
+			case imageChannelM:
+				v1, v2 = uint32(m1), uint32(m2)
+			case imageChannelY:
+				v1, v2 = uint32(y1c), uint32(y2c)
+			case imageChannelK:
+				v1, v2 = uint32(k1), uint32(k2)
+			}
+		} else {
+			r1, g1, b1, a1 := i.Key.At(int(x1), int(y1)).RGBA()
+			r2, g2, b2, a2 := i.Key.At(int(x2), int(y2)).RGBA()
+			switch channel {
+			case imageChannelR:
+				v1, v2 = r1>>8, r2>>8
+			case imageChannelG:
+				v1, v2 = g1>>8, g2>>8
+			case imageChannelB:
+				v1, v2 = b1>>8, b2>>8
+			case imageChannelA:
+				v1, v2 = a1>>8, a2>>8
+			}
+		}
+
+		decoded := byte((int(v1) - int(v2) + int(supplement) + 256) % 256)
+		if _, err := w.Write([]byte{decoded}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (i *imageEncoder) Validate() error {
+	if i.Key == nil {
+		return ErrorInvalidKey
+	}
+	if i.Key.Bounds().Max.X < imageKeySize || i.Key.Bounds().Max.Y < imageKeySize {
+		return ErrorImageKeyTooSmall
+	}
+	return nil
+}
+
+func getImagePixelMatch(b byte, key image.Image, x1 int64, y1 int64, x2 int64, y2 int64) (bool, uint8, uint8, error) {
+	r1, g1, b1, a1 := key.At(int(x1), int(y1)).RGBA()
+	r2, g2, b2, a2 := key.At(int(x2), int(y2)).RGBA()
+	cmykImage, ok := key.(*image.CMYK)
+	var c1, m1, y1c, k1, c2, m2, y2c, k2 uint8
+	channels := []uint8{imageChannelR, imageChannelG, imageChannelB, imageChannelA}
+	if ok {
+		channels = append(channels, imageChannelC, imageChannelM, imageChannelY, imageChannelK)
+		c1, m1, y1c, k1 = cmykImage.CMYKAt(int(x1), int(y1)).C, cmykImage.CMYKAt(int(x1), int(y1)).M, cmykImage.CMYKAt(int(x1), int(y1)).Y, cmykImage.CMYKAt(int(x1), int(y1)).K
+		c2, m2, y2c, k2 = cmykImage.CMYKAt(int(x2), int(y2)).C, cmykImage.CMYKAt(int(x2), int(y2)).M, cmykImage.CMYKAt(int(x2), int(y2)).Y, cmykImage.CMYKAt(int(x2), int(y2)).K
+	}
+
+	for len(channels) > 0 {
+		idx, err := getRandomInt(int64(len(channels)))
+		if err != nil {
+			return false, 0, 0, err
+		}
+		switch channels[idx] {
+		case imageChannelR:
+			match, supplement := checkMatch(b, uint16(r1>>8), uint16(r2>>8))
+			if match {
+				return true, imageChannelR, supplement, nil
+			}
+		case imageChannelG:
+			match, supplement := checkMatch(b, uint16(g1>>8), uint16(g2>>8))
+			if match {
+				return true, imageChannelG, supplement, nil
+			}
+		case imageChannelB:
+			match, supplement := checkMatch(b, uint16(b1>>8), uint16(b2>>8))
+			if match {
+				return true, imageChannelB, supplement, nil
+			}
+		case imageChannelA:
+			match, supplement := checkMatch(b, uint16(a1>>8), uint16(a2>>8))
+			if match {
+				return true, imageChannelA, supplement, nil
+			}
+		case imageChannelC:
+			match, supplement := checkMatch(b, uint16(c1), uint16(c2))
+			if match {
+				return true, imageChannelC, supplement, nil
+			}
+		case imageChannelM:
+			match, supplement := checkMatch(b, uint16(m1), uint16(m2))
+			if match {
+				return true, imageChannelM, supplement, nil
+			}
+		case imageChannelY:
+			match, supplement := checkMatch(b, uint16(y1c), uint16(y2c))
+			if match {
+				return true, imageChannelY, supplement, nil
+			}
+		case imageChannelK:
+			match, supplement := checkMatch(b, uint16(k1), uint16(k2))
+			if match {
+				return true, imageChannelK, supplement, nil
+			}
+		}
+		channels = append(channels[:idx], channels[idx+1:]...)
+	}
+	return false, 0, 0, nil
+}
+
+func encodeImage(x1, y1, x2, y2 uint16, channel, supplement uint8, w io.Writer) error {
+	err := binary.Write(w, binary.BigEndian, x1)
+	if err != nil {
+		return err
+	}
+	err = binary.Write(w, binary.BigEndian, y1)
+	if err != nil {
+		return err
+	}
+	err = binary.Write(w, binary.BigEndian, x2)
+	if err != nil {
+		return err
+	}
+	err = binary.Write(w, binary.BigEndian, y2)
+	if err != nil {
+		return err
+	}
+	err = binary.Write(w, binary.BigEndian, channel)
+	if err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, supplement)
 }

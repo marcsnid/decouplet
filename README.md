@@ -2,17 +2,19 @@
 
 A cryptographic library in Go for decoupling bytes using variable-length keys.  
 decouplet transforms input bytes by referencing a key and calculating deltas,  
-producing output that represents measurements relative to that key— effectively  
+producing output that represents measurements relative to that key; effectively  
 removing any inherent meaning from the original message without the key.
 
 [![GoDoc](https://godoc.org/github.com/marcsnid/decouplet?status.svg)](https://godoc.org/github.com/marcsnid/decouplet)
 
 ### Encoder Types
 
-Type | Key | Delta
------|-----|------
-Image|image.Image|Pixel values in RGBA and CMYK
-Byte |[]byte|Standard byte-wise delta calculations
+Type | Key | Delta| Encoded Size per Byte
+-----|-----|------|-----
+Image|image.Image|Pixel values in RGBA and CMYK|10 bytes
+Byte |[]byte|Standard byte-wise delta calculations|5 bytes
+
+Note: Each input byte size is enlarged to their respective encoded size, plus an additional 2 bytes for the start and end markers.
 
 ### Use Cases
 
@@ -31,8 +33,8 @@ go get -u github.com/marcsnid/decouplet
 
 ### Testing
 
-Place images named `test.jpg` and `test.png` in images folder.
+Place images named `test.png`, `test2.png`, `tux.ppm` in the decouplet folder.
 
-#### Credit
+### Credit
 
 Idea based on *DVNC Whitepaper* by Joseph Lloyd, licensed under FDL 1.3

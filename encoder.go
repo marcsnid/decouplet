@@ -1,133 +1,99 @@
 package decouplet
 
 import (
-	"bufio"
-	"bytes"
+	"crypto/rand"
+	"errors"
 	"io"
-	"io/ioutil"
+	"math/big"
 )
 
-type encodingKey interface {
-	getVersion() encoderInfo
-	checkValid() (bool, error)
-	getDictionarySet() dictionarySet
-	getDictionary() dictionary
-	checkVariance() int
+var (
+	ErrorMatchNotFound         = errors.New("match not found")
+	ErrorDecodeNotFound        = errors.New("valid decode character not found")
+	ErrorKeyCastFailed         = errors.New("failed to cast key")
+	ErrorDecodeGeneric         = errors.New("decode error")
+	ErrorDecodeGroup           = errors.New("decode groups missing locations")
+	ErrorInvalidKey            = errors.New("invalid key")
+	ErrorBytesInvalidKeyLength = errors.New("invalid key length, must be between 32 and 64 bytes")
+	ErrorImageKeyTooSmall      = errors.New("key needs to be larger than 300x300")
+)
+
+const (
+	stxByte byte = 0x02 // Start of Text
+	etxByte byte = 0x03 // End of Text
+)
+
+type Encoder interface {
+	Encode(io.Reader, io.Writer) error
+	Decode(io.Reader, io.Writer) error
+	Validate() error
 }
 
-func encode(
-	input []byte,
-	key encodingKey,
-	encoder func(byte, encodingKey) ([]byte, error),
-) ([]byte, error) {
-	if valid, err := key.checkValid(); !valid {
-		return nil, err
-	}
-
-	b, err := key.getVersion().writeVersion()
-	if err != nil {
-		return nil, err
-	}
-	reader, err := encodeStream(bytes.NewReader(input), key, encoder)
-	if err != nil {
-		return nil, err
-	}
-
-	output, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	err = reader.Close()
-	if err != nil {
-		return nil, err
-	}
-	return append(b, output...), nil
+func startEncode(w io.Writer) error {
+	_, err := w.Write([]byte{stxByte})
+	return err
 }
 
-func encodeStream(
-	input io.Reader,
-	key encodingKey,
-	encoder func(byte, encodingKey) ([]byte, error),
-) (*io.PipeReader, error) {
-	if valid, err := key.checkValid(); !valid {
-		return nil, err
-	}
-	reader, writer := io.Pipe()
-	go func(
-		input io.Reader,
-		writer *io.PipeWriter,
-		encoder func(byte, encodingKey) ([]byte, error),
-		key encodingKey) {
-
-		scanner := bufio.NewScanner(input)
-		scanner.Split(bufio.ScanBytes)
-
-		for scanner.Scan() {
-			m, err := encoder(scanner.Bytes()[0], key)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-			_, err = writer.Write(m)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			writer.CloseWithError(err)
-			return
-		}
-		writer.Close()
-	}(input, writer, encoder, key)
-
-	return reader, nil
+func finishEncode(w io.Writer) error {
+	_, err := w.Write([]byte{etxByte})
+	return err
 }
 
-func encodePartialStream(
-	input io.Reader,
-	key encodingKey,
-	take int,
-	skip int,
-	encoder func(byte, encodingKey) ([]byte, error),
-) (*io.PipeReader, error) {
-	reader, writer := io.Pipe()
-	if valid, err := key.checkValid(); !valid {
-		return nil, err
+func readAndVerifyStart(r io.Reader) error {
+	start := make([]byte, 1)
+	if _, err := io.ReadFull(r, start); err != nil {
+		return err
 	}
+	if start[0] != stxByte {
+		return ErrorDecodeNotFound
+	}
+	return nil
+}
 
-	go func() {
-		defer writer.Close()
-		for {
-			_, err := writer.Write(partialStartBytes)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-			takeR := io.LimitReader(input, int64(take))
-			encodedR, err := encodeStream(takeR, key, encoder)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-			_, err = io.Copy(writer, encodedR)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-			_, err = writer.Write(partialEndBytes)
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
-			_, err = io.CopyN(writer, input, int64(skip))
-			if err != nil {
-				writer.CloseWithError(err)
-				return
-			}
+func readAndCheckETX(r io.Reader, buffer []byte, recordSize int) (bool, error) {
+	n, err := io.ReadFull(r, buffer[:recordSize])
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// If we only got 1 byte and it's ETX, that's the end
+		if n == 1 && buffer[0] == etxByte {
+			return true, nil
 		}
-	}()
+		if n == 0 {
+			return false, io.EOF
+		}
+		return false, ErrorDecodeNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
 
-	return reader, nil
+func getRandomInt(max int64) (int, error) {
+	bMax := big.NewInt(max)
+	n, err := rand.Int(rand.Reader, bMax)
+	if err != nil {
+		return 0, err
+	}
+	return int(n.Int64()), nil
+}
+
+func getRandomPair(bounds int64) (int, int, error) {
+	x1, err := getRandomInt(bounds)
+	if err != nil {
+		return 0, 0, err
+	}
+	x2, err := getRandomInt(bounds)
+	if err != nil {
+		return 0, 0, err
+	}
+	return x1, x2, nil
+}
+
+func checkMatch(b byte, x, y uint16) (bool, uint8) {
+	for supplement := 0; supplement < 256; supplement++ {
+		if b == byte((x-y+uint16(supplement)+256)%256) {
+			return true, uint8(supplement)
+		}
+	}
+	return false, 0
 }
