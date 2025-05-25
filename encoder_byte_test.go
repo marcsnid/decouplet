@@ -6,7 +6,8 @@ import (
 	"testing"
 )
 
-func TestByteEncoder_RoundTrip(t *testing.T) {
+// TestByteEncoder_Full tests the encoding and decoding functionality of the ByteEncoder
+func TestByteEncoder_Full(t *testing.T) {
 	key := make([]byte, 256)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatalf("failed to generate random key: %v", err)
@@ -31,6 +32,7 @@ func TestByteEncoder_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestByteEncoder_OutputSize tests the output size of the encoded data
 func TestByteEncoder_OutputSize(t *testing.T) {
 	key := make([]byte, 256)
 	if _, err := rand.Read(key); err != nil {
