@@ -5,6 +5,13 @@ import (
 	"io"
 )
 
+const (
+	byteRetriesPerByte = 1000 // Number of retries to find a match for each byte
+	byteEncodedSize    = 5    // Each byte is encoded as 5 bytes
+	maxKeySize         = 512  // Maximum key size for byte encoder
+	minKeySize         = 32   // Minimum key size for byte encoder
+)
+
 // ByteEncoder is an implementation of the Encoder that uses a byte slice as a key
 type byteEncoder struct {
 	Key []byte
@@ -38,25 +45,20 @@ func (b *byteEncoder) encode(r io.Reader, w io.Writer) error {
 				found := false
 				for !found {
 					checks++
-					if checks >= imageRetriesPerByte {
+					if checks >= byteRetriesPerByte {
 						return ErrorMatchNotFound
 					}
-					x1, err := getRandomInt(int64(bounds))
+					x1, x2, err := getRandomPair(int64(bounds))
 					if err != nil {
 						return err
 					}
-					x2, err := getRandomInt(int64(bounds))
-					if err != nil {
-						return err
-					}
-					for supplement := 0; supplement < 256; supplement++ {
-						if buf[idx] == byte((x1-x2+supplement+256)%256) {
-							err = encodeByte(uint16(x1), uint16(x2), uint8(supplement), w)
-							if err != nil {
-								return err
-							}
-							found = true
+					match, supplement := checkMatch(buf[idx], uint16(x1), uint16(x2))
+					if match {
+						err = encodeByte(uint16(x1), uint16(x2), uint8(supplement), w)
+						if err != nil {
+							return err
 						}
+						found = true
 					}
 				}
 			}
@@ -85,7 +87,7 @@ func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
 		return err
 	}
 
-	buffer := make([]byte, 5)
+	buffer := make([]byte, byteEncodedSize)
 	for {
 		end, err := checkForETX(r, buffer)
 		if err != nil {

@@ -79,6 +79,18 @@ func getRandomInt(max int64) (int, error) {
 	return int(n.Int64()), nil
 }
 
+func getRandomPair(bounds int64) (int, int, error) {
+	x1, err := getRandomInt(bounds)
+	if err != nil {
+		return 0, 0, err
+	}
+	x2, err := getRandomInt(bounds)
+	if err != nil {
+		return 0, 0, err
+	}
+	return x1, x2, nil
+}
+
 func checkMatch(b byte, x, y uint16) (bool, uint8) {
 	for supplement := 0; supplement < 256; supplement++ {
 		if b == byte((x-y+uint16(supplement)+256)%256) {
