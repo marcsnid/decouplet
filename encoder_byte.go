@@ -1,20 +1,27 @@
 package decouplet
 
 import (
-	"encoding/binary"
+	"bufio"
 	"io"
 )
 
 const (
-	byteRetriesPerByte = 1000 // Number of retries to find a match for each byte
-	byteEncodedSize    = 5    // Each byte is encoded as 5 bytes
-	byteMaxKeySize     = 512  // Maximum key size for byte encoder
-	byteMinKeySize     = 32   // Minimum key size for byte encoder
+	byteMaxKeySize = 512 // Maximum key size for byte encoder
+	byteMinKeySize = 32  // Minimum key size for byte encoder
+
+	// Cap the number of index pairs stored per delta so the precompute table
+	// stays bounded.
+	bytePairsPerDeltaCap = 4096
 )
 
-// ByteEncoder is an implementation of the Encoder that uses a byte slice as a key
+// ByteEncoder encodes a byte stream using a byte slice as the key.
+//
+// Each byte is represented as the difference between two key positions,
+// key[a] - key[b], with a three-position fallback key[a] - key[b] + key[c]
+// when no two-position pair exists for that byte.
 type byteEncoder struct {
 	Key []byte
+	tc  *byteTranscoder
 }
 
 func NewByteEncoder(key []byte) Encoder {
@@ -22,92 +29,17 @@ func NewByteEncoder(key []byte) Encoder {
 }
 
 func (b *byteEncoder) Encode(r io.Reader, w io.Writer) error {
-	err := b.Validate()
-	if err != nil {
+	if err := b.Validate(); err != nil {
 		return err
 	}
-	return b.encode(r, w)
-}
-
-// encode is the main encoding function for the byte encoder.
-func (b *byteEncoder) encode(r io.Reader, w io.Writer) error {
-	bounds := len(b.Key)
-
-	err := startEncode(w)
-	if err != nil {
-		return err
-	}
-	buf := make([]byte, 4096)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			checks := 0
-			for idx := 0; idx < n; idx++ {
-				found := false
-				for !found {
-					checks++
-					if checks >= byteRetriesPerByte {
-						return ErrorMatchNotFound
-					}
-					x1, x2, err := getRandomPair(int64(bounds))
-					if err != nil {
-						return err
-					}
-					match, supplement := checkMatch(buf[idx], uint16(x1), uint16(x2))
-					if match {
-						err = encodeByte(uint16(x1), uint16(x2), uint8(supplement), w)
-						if err != nil {
-							return err
-						}
-						found = true
-					}
-				}
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return finishEncode(w)
+	return encodeStream(b.tc, b.Key, r, w)
 }
 
 func (b *byteEncoder) Decode(r io.Reader, w io.Writer) error {
-	err := b.Validate()
-	if err != nil {
+	if err := b.Validate(); err != nil {
 		return err
 	}
-	return b.decode(r, w)
-}
-
-// decode is the main decoding function for the byte encoder.
-func (b *byteEncoder) decode(r io.Reader, w io.Writer) error {
-	err := readAndVerifyStart(r)
-	if err != nil {
-		return err
-	}
-
-	buffer := make([]byte, byteEncodedSize)
-	for {
-		end, err := readAndCheckETX(r, buffer, byteEncodedSize)
-		if err != nil {
-			return err
-		}
-		if end {
-			break
-		}
-
-		x1 := binary.BigEndian.Uint16(buffer[0:2])
-		x2 := binary.BigEndian.Uint16(buffer[2:4])
-		supplement := buffer[4]
-		decoded := byte((int(x1) - int(x2) + int(supplement) + 256) % 256)
-		if _, err := w.Write([]byte{decoded}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return decodeStream(b.tc, b.Key, r, w)
 }
 
 func (b *byteEncoder) Validate() error {
@@ -117,17 +49,190 @@ func (b *byteEncoder) Validate() error {
 	if len(b.Key) < byteMinKeySize || len(b.Key) > byteMaxKeySize {
 		return ErrorBytesInvalidKeyLength
 	}
+	if b.tc == nil {
+		tc, err := buildByteTranscoder(b.Key)
+		if err != nil {
+			return err
+		}
+		b.tc = tc
+	}
 	return nil
 }
 
-func encodeByte(x1, x2 uint16, supplement uint8, w io.Writer) error {
-	err := binary.Write(w, binary.BigEndian, x1)
+// byteTranscoder holds the precomputed tables for one byte key.
+type byteTranscoder struct {
+	key      []byte
+	idxWidth int
+	// deltaPairs[d] is a list of (a, b) index pairs with key[a]-key[b] == d.
+	// Capped at bytePairsPerDeltaCap entries to bound memory.
+	deltaPairs [256][][2]uint16
+	// representable[b] is true if byte b can be carried by a two- or
+	// three-position relation into this key.
+	representable [256]bool
+}
+
+func buildByteTranscoder(key []byte) (*byteTranscoder, error) {
+	n := len(key)
+	tc := &byteTranscoder{key: key, idxWidth: indexWidth(n)}
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			d := uint8(int(key[i]) - int(key[j]))
+			if len(tc.deltaPairs[d]) < bytePairsPerDeltaCap {
+				tc.deltaPairs[d] = append(tc.deltaPairs[d], [2]uint16{uint16(i), uint16(j)})
+			}
+		}
+	}
+	// A byte is representable if a two-position pair exists, or a three-position
+	// pair exists: key[a]-key[b]+key[c] == b, i.e. key[a]-key[b] == b-key[c].
+	for b := 0; b < 256; b++ {
+		if len(tc.deltaPairs[uint8(b)]) > 0 {
+			tc.representable[b] = true
+			continue
+		}
+		for x3 := 0; x3 < n; x3++ {
+			need := uint8(int(b) - int(key[x3]))
+			if len(tc.deltaPairs[need]) > 0 {
+				tc.representable[b] = true
+				break
+			}
+		}
+	}
+	for b := 0; b < 256; b++ {
+		if !tc.representable[b] {
+			return nil, ErrorKeyTooSparse
+		}
+	}
+	return tc, nil
+}
+
+func (b *byteEncoder) transcode(stream []byte, w io.Writer) error {
+	return b.tc.transcode(stream, w)
+}
+
+func (b *byteEncoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
+	return b.tc.untranscode(r, recs)
+}
+
+func (tc *byteTranscoder) transcode(stream []byte, w io.Writer) error {
+	rng, err := newRNG()
 	if err != nil {
 		return err
 	}
-	err = binary.Write(w, binary.BigEndian, x2)
-	if err != nil {
-		return err
+	width := tc.idxWidth
+	n := len(tc.key)
+	var rec [7]byte // tag + up to 3 two-byte indices
+	for _, byt := range stream {
+		pairs := tc.deltaPairs[byt]
+		if len(pairs) > 0 {
+			p := pairs[rng.IntN(len(pairs))]
+			rec[0] = 0x00 // two-reference tag
+			putIdx(rec[1:], width, int(p[0]))
+			putIdx(rec[1+width:], width, int(p[1]))
+			if _, err := w.Write(rec[:1+2*width]); err != nil {
+				return err
+			}
+			continue
+		}
+		// Three-reference fallback: find x3 so that key[a]-key[b] == byt-key[x3]
+		// is a reachable two-reference delta.
+		var x3 int
+		found := false
+		for x := 0; x < n; x++ {
+			need := uint8(int(byt) - int(tc.key[x]))
+			if len(tc.deltaPairs[need]) > 0 {
+				x3 = x
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrorKeyTooSparse
+		}
+		need := uint8(int(byt) - int(tc.key[x3]))
+		p := tc.deltaPairs[need][rng.IntN(len(tc.deltaPairs[need]))]
+		rec[0] = 0x80 // three-reference tag
+		putIdx(rec[1:], width, int(p[0]))
+		putIdx(rec[1+width:], width, int(p[1]))
+		putIdx(rec[1+2*width:], width, x3)
+		if _, err := w.Write(rec[:1+3*width]); err != nil {
+			return err
+		}
 	}
-	return binary.Write(w, binary.BigEndian, supplement)
+	return nil
+}
+
+func (tc *byteTranscoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
+	br := r
+	width := tc.idxWidth
+	n := len(tc.key)
+	out := make([]byte, 0, 256)
+	for {
+		tag, err := br.ReadByte()
+		if err == io.EOF {
+			return nil, ErrorTruncated // a well-formed stream ends with endByte
+		}
+		if err != nil {
+			return nil, err
+		}
+		if tag == endByte {
+			break
+		}
+		// The byte encoder only ever writes 0x00 (two-reference) or 0x80
+		// (three-reference). Any other value means the stream is corrupted; the
+		// MAC would catch payload changes, but this also catches framing tamper
+		// cheaply so the decoder can fail before reading the tag.
+		if tag != 0x00 && tag != 0x80 {
+			return nil, ErrorTruncated
+		}
+		three := tag&0x80 != 0
+		// Record the raw tag byte for the MAC before reading the coordinates.
+		recs.b = append(recs.b, tag)
+		x1, err := readIdxBR(br, width, recs)
+		if err != nil {
+			return nil, ErrorTruncated
+		}
+		x2, err := readIdxBR(br, width, recs)
+		if err != nil {
+			return nil, ErrorTruncated
+		}
+		if x1 >= n || x2 >= n {
+			return nil, ErrorTruncated
+		}
+		v := int(tc.key[x1]) - int(tc.key[x2])
+		if three {
+			x3, err := readIdxBR(br, width, recs)
+			if err != nil {
+				return nil, ErrorTruncated
+			}
+			if x3 >= n {
+				return nil, ErrorTruncated
+			}
+			v += int(tc.key[x3])
+		}
+		out = append(out, byte((v%256+256)%256))
+	}
+	return out, nil
+}
+
+// readIdxBR reads a 1- or 2-byte index from a buffered reader without
+// allocating, and appends the raw bytes to recs so the MAC covers them.
+func readIdxBR(br *bufio.Reader, width int, recs *bufWriter) (int, error) {
+	if width == 1 {
+		b, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		recs.b = append(recs.b, b)
+		return int(b), nil
+	}
+	hi, err := br.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	lo, err := br.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	recs.b = append(recs.b, hi, lo)
+	return int(hi)<<8 | int(lo), nil
 }
