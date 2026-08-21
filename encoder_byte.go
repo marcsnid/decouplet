@@ -2,6 +2,7 @@ package decouplet
 
 import (
 	"bufio"
+	"hash"
 	"io"
 )
 
@@ -105,23 +106,19 @@ func buildByteTranscoder(key []byte) (*byteTranscoder, error) {
 	return tc, nil
 }
 
-func (b *byteEncoder) transcode(stream []byte, w io.Writer) error {
-	return b.tc.transcode(stream, w)
+func (b *byteEncoder) transcodeChunk(chunk []byte, w io.Writer, rng *fastRNG) error {
+	return b.tc.transcodeChunk(chunk, w, rng)
 }
 
-func (b *byteEncoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
-	return b.tc.untranscode(r, recs)
+func (b *byteEncoder) untranscode(r *bufio.Reader, w io.Writer, h hash.Hash) error {
+	return b.tc.untranscode(r, w, h)
 }
 
-func (tc *byteTranscoder) transcode(stream []byte, w io.Writer) error {
-	rng, err := newRNG()
-	if err != nil {
-		return err
-	}
+func (tc *byteTranscoder) transcodeChunk(chunk []byte, w io.Writer, rng *fastRNG) error {
 	width := tc.idxWidth
 	n := len(tc.key)
 	var rec [7]byte // tag + up to 3 two-byte indices
-	for _, byt := range stream {
+	for _, byt := range chunk {
 		pairs := tc.deltaPairs[byt]
 		if len(pairs) > 0 {
 			p := pairs[rng.IntN(len(pairs))]
@@ -161,78 +158,87 @@ func (tc *byteTranscoder) transcode(stream []byte, w io.Writer) error {
 	return nil
 }
 
-func (tc *byteTranscoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
+func (tc *byteTranscoder) untranscode(r *bufio.Reader, w io.Writer, h hash.Hash) error {
 	br := r
 	width := tc.idxWidth
 	n := len(tc.key)
-	out := make([]byte, 0, 256)
+	var rec [7]byte  // tag + up to 3 two-byte indices
+	var one [1]byte
 	for {
 		tag, err := br.ReadByte()
 		if err == io.EOF {
-			return nil, ErrorTruncated // a well-formed stream ends with endByte
+			return ErrorTruncated // a well-formed stream ends with endByte
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if tag == endByte {
 			break
 		}
 		// The byte encoder only ever writes 0x00 (two-reference) or 0x80
-		// (three-reference). Any other value means the stream is corrupted; the
-		// MAC would catch payload changes, but this also catches framing tamper
-		// cheaply so the decoder can fail before reading the tag.
+		// (three-reference). Any other value means the stream is corrupted.
 		if tag != 0x00 && tag != 0x80 {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
 		three := tag&0x80 != 0
-		// Record the raw tag byte for the MAC before reading the coordinates.
-		recs.b = append(recs.b, tag)
-		x1, err := readIdxBR(br, width, recs)
+		// Collect the whole record into rec so we can feed it to the MAC in one
+		// Write instead of one per byte.
+		rec[0] = tag
+		off := 1
+		x1, off2, err := readIdxInto(br, width, rec[:], off)
 		if err != nil {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
-		x2, err := readIdxBR(br, width, recs)
+		off = off2
+		x2, off2, err := readIdxInto(br, width, rec[:], off)
 		if err != nil {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
+		off = off2
 		if x1 >= n || x2 >= n {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
 		v := int(tc.key[x1]) - int(tc.key[x2])
 		if three {
-			x3, err := readIdxBR(br, width, recs)
+			x3, off2, err := readIdxInto(br, width, rec[:], off)
 			if err != nil {
-				return nil, ErrorTruncated
+				return ErrorTruncated
 			}
+			off = off2
 			if x3 >= n {
-				return nil, ErrorTruncated
+				return ErrorTruncated
 			}
 			v += int(tc.key[x3])
 		}
-		out = append(out, byte((v%256+256)%256))
+		h.Write(rec[:off])
+		one[0] = byte((v%256 + 256) % 256)
+		if _, err := w.Write(one[:]); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
-// readIdxBR reads a 1- or 2-byte index from a buffered reader without
-// allocating, and appends the raw bytes to recs so the MAC covers them.
-func readIdxBR(br *bufio.Reader, width int, recs *bufWriter) (int, error) {
+// readIdxInto reads a 1- or 2-byte index from a buffered reader into buf at the
+// given offset, returning the index value, the new offset, and any error.
+func readIdxInto(br *bufio.Reader, width int, buf []byte, off int) (int, int, error) {
 	if width == 1 {
 		b, err := br.ReadByte()
 		if err != nil {
-			return 0, err
+			return 0, off, err
 		}
-		recs.b = append(recs.b, b)
-		return int(b), nil
+		buf[off] = b
+		return int(b), off + 1, nil
 	}
 	hi, err := br.ReadByte()
-	if err != nil {
-		return 0, err
-	}
+		if err != nil {
+			return 0, off, err
+		}
 	lo, err := br.ReadByte()
 	if err != nil {
-		return 0, err
+		return 0, off, err
 	}
-	recs.b = append(recs.b, hi, lo)
-	return int(hi)<<8 | int(lo), nil
+	buf[off] = hi
+	buf[off+1] = lo
+	return int(hi)<<8 | int(lo), off + 2, nil
 }

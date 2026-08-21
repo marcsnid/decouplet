@@ -6,6 +6,7 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"hash"
 	"io"
 
 	"math/rand/v2"
@@ -79,62 +80,76 @@ func macKey(key []byte) []byte {
 	return h.Sum(nil)
 }
 
-// macFor returns the truncated HMAC-SHA256 tag over the given record bytes.
-func macFor(key, records []byte) []byte {
-	m := hmac.New(sha256.New, macKey(key))
-	m.Write(records)
-	sum := m.Sum(nil)
-	return sum[:macSize]
-}
-
-// encodeStream runs the full encode pipeline: write the header, transcode the
-// plaintext into records, then write the end marker and a MAC over the records.
+// encodeStream runs the full encode pipeline as a stream: write the header,
+// transcode the input in chunks (never buffering the whole input), feeding every
+// record byte to a running MAC, then write the end marker and the MAC tag.
 func encodeStream(e transcoder, key []byte, r io.Reader, w io.Writer) error {
-	plaintext, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	var recs bufWriter
 	if err := writeHeader(w); err != nil {
 		return err
 	}
-	if err := e.transcode(plaintext, &recs); err != nil {
+	bw := bufio.NewWriter(w)
+	mw := &macWriter{w: bw, h: hmac.New(sha256.New, macKey(key))}
+	rng, err := newRNG()
+	if err != nil {
 		return err
 	}
-	if _, err := w.Write(recs.b); err != nil {
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if err := e.transcodeChunk(buf[:n], mw, rng); err != nil {
+				return err
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	// End marker and tag go to the output only, not through the MAC. The MAC
+	// covers the record bytes only, matching the decoder.
+	if err := writeEnd(bw); err != nil {
 		return err
 	}
-	if err := writeEnd(w); err != nil {
+	tag := mw.h.Sum(nil)[:macSize]
+	if _, err := bw.Write(tag); err != nil {
 		return err
 	}
-	tag := macFor(key, recs.b)
-	_, err = w.Write(tag)
-	return err
+	return bw.Flush()
 }
 
-// decodeStream runs the full decode pipeline: read the header, read records
-// into a byte stream, then verify the MAC before returning the bytes.
+// decodeStream runs the full decode pipeline as a stream: read the header, read
+// records one at a time writing decoded bytes to w as we go and feeding record
+// bytes to a running MAC, then read and verify the MAC tag at the end.
+//
+// Because the MAC is at the end of the stream, decoded bytes are written to w
+// before verification completes. If the MAC fails, the caller receives an error
+// but may have already received some decoded bytes. When composed with a real
+// cipher (encrypt-then-transcode), the cipher's own authentication covers this.
 func decodeStream(e transcoder, key []byte, r io.Reader, w io.Writer) error {
 	if err := readHeader(r); err != nil {
 		return err
 	}
 	br := bufio.NewReader(r)
-	var recs bufWriter
-	recs.b = make([]byte, 0, 4096)
-	stream, err := e.untranscode(br, &recs)
-	if err != nil {
+	bw := bufio.NewWriter(w)
+	h := hmac.New(sha256.New, macKey(key))
+	if err := e.untranscode(br, bw, h); err != nil {
 		return err
 	}
 	tag := make([]byte, macSize)
 	if _, err := io.ReadFull(br, tag); err != nil {
 		return ErrorTruncated
 	}
-	want := macFor(key, recs.b)
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	want := h.Sum(nil)[:macSize]
 	if !hmac.Equal(tag, want) {
 		return ErrorTamper
 	}
-	_, err = w.Write(stream)
-	return err
+	return nil
 }
 
 // writeEnd writes the end marker that terminates the record stream.
@@ -143,23 +158,25 @@ func writeEnd(w io.Writer) error {
 	return err
 }
 
-// transcoder is the encoder-specific layer. transcode turns a byte stream
-// into records; untranscode reverses it by measuring the deltas and also
-// returns the raw record bytes so the caller can checksum them.
+// transcoder is the encoder-specific layer. transcodeChunk turns a chunk of
+// input bytes into records written to w; untranscode reads records from r,
+// writes decoded bytes to w, and feeds the raw record bytes to h for the MAC.
 type transcoder interface {
-	transcode(stream []byte, w io.Writer) error
-	untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error)
+	transcodeChunk(chunk []byte, w io.Writer, rng *fastRNG) error
+	untranscode(r *bufio.Reader, w io.Writer, h hash.Hash) error
 }
 
-// bufWriter is a thin wrapper around a byte slice so the transcoders can append
-// records without per-write allocations.
-type bufWriter struct {
-	b []byte
+// macWriter writes every byte to both the underlying writer and a running MAC,
+// so records are sent to the output and fed to the MAC at the same time without
+// being buffered.
+type macWriter struct {
+	w io.Writer
+	h hash.Hash
 }
 
-func (bw *bufWriter) Write(p []byte) (int, error) {
-	bw.b = append(bw.b, p...)
-	return len(p), nil
+func (mw *macWriter) Write(p []byte) (int, error) {
+	mw.h.Write(p)
+	return mw.w.Write(p)
 }
 
 // fastRNG wraps a ChaCha8 CSPRNG seeded once from crypto/rand so that index
