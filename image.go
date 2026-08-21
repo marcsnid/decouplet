@@ -7,6 +7,7 @@ import (
 	"os"
 )
 
+// LoadImage reads and decodes an image file for use as an image encoder key.
 func LoadImage(filename string) (image.Image, error) {
 	imageFile, err := os.Open(filename)
 	if err != nil {
@@ -19,14 +20,4 @@ func LoadImage(filename string) (image.Image, error) {
 		return nil, err
 	}
 	return img, nil
-}
-
-func getPixelNumber(x int, y int, width int) int {
-	return y*width + x
-}
-
-func getCoordinates(pixelNumber int, imageWidth int) (int, int) {
-	x := pixelNumber % imageWidth
-	y := pixelNumber / imageWidth
-	return x, y
 }
