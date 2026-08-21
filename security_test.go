@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	crand "crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	"testing"
 )
 
@@ -127,8 +129,9 @@ func TestByteEncoder_HomophonicProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 	stream := bytes.Repeat([]byte{0x41}, 2000) // 'A' repeated
+	rng := newRNGFromSeed([32]byte{})
 	var out bytes.Buffer
-	if err := tc.transcode(stream, &out); err != nil {
+	if err := tc.transcodeChunk(stream, &out, rng); err != nil {
 		t.Fatal(err)
 	}
 	recs := out.Bytes()
@@ -143,16 +146,17 @@ func TestByteEncoder_HomophonicProperty(t *testing.T) {
 		t.Fatalf("only %d distinct records for 2000 identical bytes", len(seen))
 	}
 	t.Logf("2000 identical bytes -> %d distinct records", len(seen))
-	// Round-trip the stream. transcode does not write the end marker itself
-	// (the pipeline adds header, end, and MAC around it), so append them here.
+	// Round-trip the stream. transcodeChunk does not write the end marker
+	// itself (the pipeline adds header, end, and MAC around it), so append it.
 	var full bytes.Buffer
 	full.Write(recs)
 	full.WriteByte(endByte)
-	back, err := tc.untranscode(bufio.NewReader(bytes.NewReader(full.Bytes())), &bufWriter{})
-	if err != nil {
+	var back bytes.Buffer
+	h := hmac.New(sha256.New, macKey(key))
+	if err := tc.untranscode(bufio.NewReader(bytes.NewReader(full.Bytes())), &back, h); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(stream, back) {
+	if !bytes.Equal(stream, back.Bytes()) {
 		t.Fatalf("transcode did not round-trip")
 	}
 }

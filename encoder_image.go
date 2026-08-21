@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash"
 	"image"
 	"io"
 )
@@ -174,23 +175,19 @@ func buildImageTranscoder(img image.Image) (*imageTranscoder, error) {
 	return tc, nil
 }
 
-func (i *imageEncoder) transcode(stream []byte, w io.Writer) error {
-	return i.tc.transcode(stream, w)
+func (i *imageEncoder) transcodeChunk(chunk []byte, w io.Writer, rng *fastRNG) error {
+	return i.tc.transcodeChunk(chunk, w, rng)
 }
 
-func (i *imageEncoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
-	return i.tc.untranscode(r, recs)
+func (i *imageEncoder) untranscode(r *bufio.Reader, w io.Writer, h hash.Hash) error {
+	return i.tc.untranscode(r, w, h)
 }
 
-func (tc *imageTranscoder) transcode(stream []byte, w io.Writer) error {
-	rng, err := newRNG()
-	if err != nil {
-		return err
-	}
+func (tc *imageTranscoder) transcodeChunk(chunk []byte, w io.Writer, rng *fastRNG) error {
 	channels := tc.channels
 	var orderBuf [8]int
 	var rec [13]byte // tag + up to 3 two-byte coordinate pairs
-	for _, byt := range stream {
+	for _, byt := range chunk {
 		// Pick a channel that can carry this byte, trying channels in random
 		// order. Two references are preferred over three.
 		order := orderBuf[:len(channels)]
@@ -249,49 +246,57 @@ func (tc *imageTranscoder) transcode(stream []byte, w io.Writer) error {
 	return nil
 }
 
-func (tc *imageTranscoder) untranscode(r *bufio.Reader, recs *bufWriter) ([]byte, error) {
+func (tc *imageTranscoder) untranscode(r *bufio.Reader, w io.Writer, h hash.Hash) error {
 	br := r
-	out := make([]byte, 0, 256)
+	var rec [13]byte // tag + up to 3 four-byte coordinate pairs
+	var one [1]byte
 	for {
 		tag, err := br.ReadByte()
 		if err == io.EOF {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if tag == endByte {
 			break
 		}
 		ch := tag & 0x7F
 		three := tag&0x80 != 0
-		// Record the raw tag byte for the MAC.
-		recs.b = append(recs.b, tag)
-		c1, err := readImgCoordBR(br, recs)
+		rec[0] = tag
+		off := 1
+		off, err = readImgCoordInto(br, rec[:], off)
 		if err != nil {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
-		c2, err := readImgCoordBR(br, recs)
+		c1 := imgCoord{binary.BigEndian.Uint16(rec[1:3]), binary.BigEndian.Uint16(rec[3:5])}
+		off, err = readImgCoordInto(br, rec[:], off)
 		if err != nil {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
+		c2 := imgCoord{binary.BigEndian.Uint16(rec[5:7]), binary.BigEndian.Uint16(rec[7:9])}
 		if !tc.inBounds(c1) || !tc.inBounds(c2) {
-			return nil, ErrorTruncated
+			return ErrorTruncated
 		}
 		v := int(pixelVal(tc.img, int(c1.x), int(c1.y), ch)) - int(pixelVal(tc.img, int(c2.x), int(c2.y), ch))
 		if three {
-			c3, err := readImgCoordBR(br, recs)
+			off, err = readImgCoordInto(br, rec[:], off)
 			if err != nil {
-				return nil, ErrorTruncated
+				return ErrorTruncated
 			}
+			c3 := imgCoord{binary.BigEndian.Uint16(rec[9:11]), binary.BigEndian.Uint16(rec[11:13])}
 			if !tc.inBounds(c3) {
-				return nil, ErrorTruncated
+				return ErrorTruncated
 			}
 			v += int(pixelVal(tc.img, int(c3.x), int(c3.y), ch))
 		}
-		out = append(out, byte((v%256+256)%256))
+		h.Write(rec[:off])
+		one[0] = byte((v%256 + 256) % 256)
+		if _, err := w.Write(one[:]); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
 func (tc *imageTranscoder) inBounds(c imgCoord) bool {
@@ -304,28 +309,17 @@ func putImgCoord(buf []byte, c imgCoord) {
 	binary.BigEndian.PutUint16(buf[2:4], c.y)
 }
 
-// readImgCoordBR reads a 4-byte coordinate from a buffered reader without the
-// per-call heap escape that io.ReadFull with a stack buffer would cause, and
-// appends the raw bytes to recs so the MAC covers them.
-func readImgCoordBR(br *bufio.Reader, recs *bufWriter) (imgCoord, error) {
-	xHi, err := br.ReadByte()
-	if err != nil {
-		return imgCoord{}, err
+// readImgCoordInto reads a 4-byte coordinate from a buffered reader into buf
+// at the given offset, returning the new offset. No allocation.
+func readImgCoordInto(br *bufio.Reader, buf []byte, off int) (int, error) {
+	for i := 0; i < 4; i++ {
+		b, err := br.ReadByte()
+		if err != nil {
+			return off, err
+		}
+		buf[off+i] = b
 	}
-	xLo, err := br.ReadByte()
-	if err != nil {
-		return imgCoord{}, err
-	}
-	yHi, err := br.ReadByte()
-	if err != nil {
-		return imgCoord{}, err
-	}
-	yLo, err := br.ReadByte()
-	if err != nil {
-		return imgCoord{}, err
-	}
-	recs.b = append(recs.b, xHi, xLo, yHi, yLo)
-	return imgCoord{uint16(xHi)<<8 | uint16(xLo), uint16(yHi)<<8 | uint16(yLo)}, nil
+	return off + 4, nil
 }
 
 // pixelVal reads a single channel value from an image, handling RGBA and CMYK.
